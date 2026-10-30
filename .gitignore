@@ -1,0 +1,15 @@
+# Never store credentials, app sources, archives, or build products here.
+*.keystore
+*.jks
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+*.apk
+*.aab
+*.zip
+private-src/
+.gradle/
+**/build/
