@@ -1,0 +1,183 @@
+name: Manual build verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: protected-build
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Prepare Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android tools
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        with:
+          packages: platform-tools
+
+      - name: Prepare SDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0' > /dev/null 2>&1
+
+      - name: Prepare Gradle
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Fetch approved private source
+        env:
+          PRIVATE_REPOSITORY: ${{ secrets.PRIVATE_REPOSITORY }}
+          PRIVATE_SOURCE_REF: ${{ secrets.PRIVATE_SOURCE_REF }}
+          PRIVATE_READ_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          if [[ -z "$PRIVATE_REPOSITORY" || -z "$PRIVATE_SOURCE_REF" || -z "$PRIVATE_READ_TOKEN" ]]; then
+            echo 'Private-source configuration missing.'
+            exit 1
+          fi
+          umask 077
+          mkdir -p private-src
+          cd private-src
+          git init --quiet
+          git remote add origin "https://github.com/${PRIVATE_REPOSITORY}.git"
+          basic="$(printf 'x-access-token:%s' "$PRIVATE_READ_TOKEN" | base64 -w0)"
+          if ! git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}" \
+                 fetch --quiet --depth=1 origin "$PRIVATE_SOURCE_REF" >/dev/null 2>&1; then
+            echo 'Private source fetch failed; no source details printed.'
+            exit 1
+          fi
+          git checkout --quiet --detach FETCH_HEAD >/dev/null 2>&1
+          git rev-parse HEAD > "$RUNNER_TEMP/approved-source-sha"
+          rm -rf .git
+          test -f settings.gradle.kts && test -f app/build.gradle.kts
+          echo 'Trusted source fetched into temporary runner only.'
+
+      - name: Check private source boundaries
+        working-directory: private-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          if ! python3 tools/check_notification_experience.py > "$RUNNER_TEMP/source-check.log" 2>&1; then
+            echo 'Private offline notification check failed. No private log uploaded.'
+            exit 1
+          fi
+          if ! python3 tools/check_notification_handoff.py > "$RUNNER_TEMP/handoff-check.log" 2>&1; then
+            echo 'Private handoff check failed. No private log uploaded.'
+            exit 1
+          fi
+          echo 'Offline checks passed.'
+
+      - name: Compile without publishing source or logs
+        working-directory: private-src
+        env:
+          ANDROID_SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          if [[ -z "$ANDROID_SIGNING_PASSWORD" ]]; then
+            echo 'Signing secret not configured.'
+            exit 1
+          fi
+          umask 077
+          if ! gradle :app:lintDebug :app:assembleDebug --no-daemon > "$RUNNER_TEMP/private-gradle.log" 2>&1; then
+            echo 'Private build failed. Detailed compiler output intentionally not public.'
+            exit 1
+          fi
+          echo 'Compilation finished.'
+
+      - name: Confirm private identity and stable signing
+        working-directory: private-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          python3 - <<'PYVERIFY'
+          import pathlib, re, subprocess, os
+          base = pathlib.Path('.')
+          apk = base / 'app/build/outputs/apk/debug/app-debug.apk'
+          assert apk.is_file() and apk.stat().st_size > 1_000_000, 'APK missing'
+          gradle = (base / 'app/build.gradle.kts').read_text()
+          workflow = (base / '.github/workflows/android.yml').read_text()
+          pkg = re.search(r'applicationId\s*=\s*"([^"]+)"', gradle)
+          name = re.search(r'versionName\s*=\s*"([^"]+)"', gradle)
+          code = re.search(r'versionCode\s*=\s*(\d+)', gradle)
+          signature = re.search(r'expected="([0-9a-fA-F]{64})"', workflow)
+          assert all((pkg,name,code,signature)), 'Expected private identity evidence missing'
+          tool = pathlib.Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0'
+          verify = subprocess.run([str(tool / 'apksigner'), 'verify', '--print-certs', str(apk)],
+                                  capture_output=True, text=True, check=True)
+          certificate = re.search(r'Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]{64})', verify.stdout)
+          assert certificate and certificate.group(1).lower() == signature.group(1).lower(), 'Signing certificate mismatch'
+          badging = subprocess.check_output([str(tool/'aapt'), 'dump', 'badging', str(apk)], text=True)
+          expected = "package: name='{}' versionCode='{}' versionName='{}'".format(pkg.group(1),code.group(1),name.group(1))
+          assert expected in badging, 'Application identity mismatch'
+          print('Stable private application identity and signature verified.')
+          PYVERIFY
+
+      - name: Deliver APK to private draft release only
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_PUBLISH_TOKEN }}
+          PRIVATE_REPOSITORY: ${{ secrets.PRIVATE_REPOSITORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          test -s private-src/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$RUNNER_TEMP/approved-source-sha"
+          tag="private-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sha="$(cat "$RUNNER_TEMP/approved-source-sha")"
+          if ! gh release create "$tag" \
+            "private-src/app/build/outputs/apk/debug/app-debug.apk#candidate.apk" \
+            --repo "$PRIVATE_REPOSITORY" --target "$sha" --draft \
+            --title 'Unreviewed build candidate' \
+            --notes "Private build from approved commit ${sha}. Not device accepted." \
+            > /dev/null 2>&1; then
+            echo 'Private delivery failed. No public artifact created.'
+            exit 1
+          fi
+          echo 'Candidate APK saved as private draft release (no public artifact).'
+
+      - name: Save failed compiler diagnostics privately
+        if: ${{ failure() && github.actor == github.repository_owner && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_PUBLISH_TOKEN }}
+          PRIVATE_REPOSITORY: ${{ secrets.PRIVATE_REPOSITORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          if [[ -s "$RUNNER_TEMP/private-gradle.log" && -s "$RUNNER_TEMP/approved-source-sha" ]]; then
+            tag="private-build-failed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            sha="$(cat "$RUNNER_TEMP/approved-source-sha")"
+            gh release create "$tag" \
+              "$RUNNER_TEMP/private-gradle.log#build.log" \
+              --repo "$PRIVATE_REPOSITORY" --target "$sha" --draft \
+              --title 'Private build diagnostics' --notes 'Private build; see attached diagnostics.' \
+              > /dev/null 2>&1 || true
+            echo 'Private diagnostic report attempted; no public log uploaded.'
+          fi
+
+      - name: Clean private files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf private-src
+          rm -f "$RUNNER_TEMP/approved-source-sha" "$RUNNER_TEMP/private-gradle.log" \
+                "$RUNNER_TEMP/source-check.log" "$RUNNER_TEMP/handoff-check.log"
